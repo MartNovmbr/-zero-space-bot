@@ -53,7 +53,7 @@ def _cloud(remaining: float, size: int, glow: float = 0.0) -> Image.Image:
     return layer
 
 
-def compose_room(stage: int, chaos_remaining: int, destination: Path, size: int = 900) -> Path:
+def compose_room(stage: int, chaos_remaining: int, destination: Path, size: int = 1080) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     base = _room(stage, size)
     ratio = visual_ratio(chaos_remaining)
@@ -62,7 +62,8 @@ def compose_room(stage: int, chaos_remaining: int, destination: Path, size: int 
         base = Image.blend(base, shade, min(.20, .20*ratio))
         base = ImageEnhance.Brightness(base).enhance(1.0 - .08*ratio)
         base = Image.alpha_composite(base.convert('RGBA'), _cloud(chaos_remaining, size)).convert('RGB')
-    base.save(destination, 'JPEG', quality=88, optimize=True, progressive=True)
+    base.save(destination, 'JPEG', quality=94, optimize=True, progressive=True,
+              subsampling=0)
     return destination
 
 

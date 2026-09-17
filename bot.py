@@ -13,21 +13,32 @@ import time
 import urllib.error
 import urllib.request
 
-from media import CHAOS_TOTAL, compose_room, render_transition
+from media import CHAOS_TOTAL, compose_room
 
 ROOT = Path(__file__).resolve().parent
-LEVELS = {1: 'Совсем легко / Easy · 1 ✨', 3: 'Легко / Easy · 3 ✨',
-          7: 'Средне / Medium · 7 ✨', 12: 'Сложно / Hard · 12 ✨'}
+LEVELS = {1: 'Совсем легко · 1 ✨', 3: 'Легко · 3 ✨',
+          7: 'Средне · 7 ✨', 12: 'Сложно · 12 ✨'}
+LEVELS_EN = {1: 'Very easy · 1 ✨', 3: 'Easy · 3 ✨',
+             7: 'Medium · 7 ✨', 12: 'Hard · 12 ✨'}
 UPGRADES = [
     ('Первый уют', 'Ковёр и растение', 18),
     ('Больше света', 'Окно и льняные шторы', 53),
     ('Кабинет писателя', 'Обои, красивая дверь, кресло и письменный стол с книгами', 95),
+]
+UPGRADES_EN = [
+    ('First comfort', 'A rug and a plant', 18),
+    ('More light', 'A window and linen curtains', 53),
+    ("The writer's study", 'Wallpaper, a beautiful door, an armchair, a writing desk and books', 95),
 ]
 IMAGES = ['00-empty.png', '01-cozy.png', '02-window.png', '03-finished.png']
 CLEAR_AT = [18, 71, 166]
 AFTER_MESSAGES = [
     'Chaos fades.', 'A little more light.', 'The room can breathe again.',
     'The chaos thins. The story continues.', 'A cleaner room, a brighter chapter.'
+]
+AFTER_MESSAGES_RU = [
+    'Хаос отступает.', 'Ещё немного света.', 'Комната снова может дышать.',
+    'Хаос редеет. История продолжается.', 'Чище комната — светлее новая глава.'
 ]
 
 
@@ -115,6 +126,8 @@ class Store:
             INSERT OR IGNORE INTO meta VALUES('balance','0');
             INSERT OR IGNORE INTO meta VALUES('stage','0');
             INSERT OR IGNORE INTO meta VALUES('offset','0');
+            INSERT OR IGNORE INTO meta VALUES('undo_debt','0');
+            INSERT OR IGNORE INTO meta VALUES('language','ru');
         ''')
         earned = self.db.execute("SELECT COALESCE(sum(difficulty),0) FROM tasks WHERE status='done'").fetchone()[0]
         with self.db:
@@ -167,10 +180,31 @@ class Store:
             if not row or row['status'] != 'active':
                 return 0
             self.db.execute("UPDATE tasks SET status='done',completed=CURRENT_TIMESTAMP WHERE id=?", (task_id,))
-            self.put('balance', int(self.get('balance')) + row['difficulty'])
+            reward = row['difficulty']
+            debt = int(self.get('undo_debt', '0'))
+            debt_paid = min(debt, reward)
+            self.put('undo_debt', debt-debt_paid)
+            self.put('balance', int(self.get('balance')) + reward-debt_paid)
             self.put('total_earned', int(self.get('total_earned')) + row['difficulty'])
             self.put('chaos_remaining', max(0, int(self.get('chaos_remaining')) - row['difficulty']))
             return row['difficulty']
+
+    def undo(self, task_id):
+        """Return a completed task without rolling back purchased room stages."""
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.task(task_id)
+            if not row or row['status'] != 'done':
+                return 0
+            reward = row['difficulty']
+            balance = int(self.get('balance'))
+            charged = min(balance, reward)
+            self.db.execute("UPDATE tasks SET status='active',completed=NULL WHERE id=?", (task_id,))
+            self.put('balance', balance-charged)
+            self.put('undo_debt', int(self.get('undo_debt', '0')) + reward-charged)
+            self.put('total_earned', max(0, int(self.get('total_earned'))-reward))
+            self.put('chaos_remaining', min(CHAOS_TOTAL, int(self.get('chaos_remaining'))+reward))
+            return reward
 
     def change_difficulty(self, task_id, difficulty):
         if difficulty not in LEVELS:
@@ -208,19 +242,52 @@ def btn(text, data):
     return {'text': text, 'callback_data': data}
 
 
-MENU = [[btn('🦝 Комната', 'room'), btn('✍️ Добавить дело', 'add')],
-        [btn('☑️ Мои дела', 'list:0'), btn('🪴 Обустроить', 'shop')],
-        [btn('📖 О дивный чистый мир', 'history:0')]]
-
-
 class Bot:
     def __init__(self, api, store, pairing_code='', allowed_user=0):
         self.api, self.store = api, store
         self.pairing_code, self.allowed_user = pairing_code, allowed_user
 
+    @property
+    def lang(self):
+        return self.store.get('language', 'ru') if self.store.get('language', 'ru') in ('ru', 'en') else 'ru'
+
+    def t(self, ru, en):
+        return en if self.lang == 'en' else ru
+
+    def level_label(self, difficulty):
+        return (LEVELS_EN if self.lang == 'en' else LEVELS)[difficulty]
+
+    def menu(self):
+        rows = [[btn(self.t('🦝 Комната', '🦝 Room'), 'room'),
+                 btn(self.t('✍️ Добавить дело', '✍️ Add task'), 'add')],
+                [btn(self.t('☑️ Мои дела', '☑️ My tasks'), 'list:0'),
+                 btn(self.t('🪴 Обустроить', '🪴 Furnish'), 'shop')],
+                [btn(self.t('📖 О дивный чистый мир', '📖 O Brave Clean World'), 'history:0')]]
+        return self.with_language(rows)
+
+    def update_commands(self):
+        descriptions = [
+            ('start', self.t('Моя комната', 'My room')),
+            ('add', self.t('Добавить дело', 'Add a task')),
+            ('tasks', self.t('Мои дела', 'My tasks')),
+            ('shop', self.t('Обустроить комнату', 'Furnish the room')),
+            ('language', self.t('Русский / English', 'Русский / English')),
+            ('cancel', self.t('Отменить ввод', 'Cancel input')),
+            ('help', self.t('Как всё работает', 'How it works')),
+        ]
+        self.api.call('setMyCommands', commands=[{'command': command, 'description': description}
+                                                  for command, description in descriptions])
+
+    def with_language(self, keyboard):
+        rows = [list(row) for row in (keyboard or [])]
+        target, label = ('en', '🌐 English') if self.lang == 'ru' else ('ru', '🌐 Русский')
+        if not any(button.get('callback_data', '').startswith('lang:') for row in rows for button in row):
+            rows.append([btn(label, f'lang:{target}')])
+        return rows
+
     def send(self, chat, text, keyboard=None):
         return self.api.call('sendMessage', chat_id=chat, text=text,
-            reply_markup={'inline_keyboard': MENU if keyboard is None else keyboard})
+            reply_markup={'inline_keyboard': self.menu() if keyboard is None else self.with_language(keyboard)})
 
     def authorized(self, message):
         if message.get('chat', {}).get('type') != 'private':
@@ -244,27 +311,38 @@ class Bot:
         chaos = int(self.store.get('chaos_remaining'))
         cleared = CHAOS_TOTAL-chaos
         count = self.store.db.execute("SELECT count(*) FROM tasks WHERE status='done'").fetchone()[0]
-        text = (f'ZERO SPACE\nClean. Create. Continue the story.\n\n🦝 Комната енота-писателя Реда\n\n✨ Искры: {balance}\n'
-                f'Наград в твоей истории: {count}\nОбустройство: {stage}/3\n\n')
-        text += f'🌫 Хаос рассеян на {round(cleared/CHAOS_TOTAL*100)}% · осталось {chaos}/{CHAOS_TOTAL}\n\n'
-        text += ('Теперь у Реда есть свой писательский уголок. Новая глава начинается с тебя 🤍' if stage == 3 else
-                 'Даже одно маленькое дело — новая строчка в нашей истории. Ред рад тебе и после перерыва.')
+        if self.lang == 'en':
+            text = (f'ZERO SPACE\nClean. Create. Continue the story.\n\n🦝 Red the raccoon writer’s room\n\n'
+                    f'✨ Sparks: {balance}\nRewards in your story: {count}\nFurnishing: {stage}/3\n\n'
+                    f'🌫 Chaos cleared: {round(cleared/CHAOS_TOTAL*100)}% · {chaos}/{CHAOS_TOTAL} remains\n\n')
+            text += ("Red now has his own writing corner. A new chapter begins with you 🤍" if stage == 3 else
+                     'Even one tiny task is a new line in our story. Red is happy to see you, even after a break.')
+        else:
+            text = (f'ZERO SPACE\nClean. Create. Continue the story.\n\n🦝 Комната енота-писателя Реда\n\n'
+                    f'✨ Искры: {balance}\nНаград в твоей истории: {count}\nОбустройство: {stage}/3\n\n'
+                    f'🌫 Хаос рассеян на {round(cleared/CHAOS_TOTAL*100)}% · осталось {chaos}/{CHAOS_TOTAL}\n\n')
+            text += ('Теперь у Реда есть свой писательский уголок. Новая глава начинается с тебя 🤍' if stage == 3 else
+                     'Даже одно маленькое дело — новая строчка в нашей истории. Ред рад тебе и после перерыва.')
+        self.send_room_photo(chat, text, stage, chaos)
+
+    def send_room_photo(self, chat, caption, stage, chaos, keyboard=None):
         cache = Path(os.environ.get('MEDIA_CACHE', str(ROOT/'data'/'media_cache')))
-        image_path = cache/f'room-{stage}-{chaos}.jpg'
+        image_path = cache/f'room-v2-{stage}-{chaos}.jpg'
         if not image_path.exists():
             compose_room(stage, chaos, image_path)
-        file_key = f'photo:{stage}:{chaos}'
+        file_key = f'photo:v2:{stage}:{chaos}'
         file_id = self.store.get(file_key)
         result = None
+        markup = self.menu() if keyboard is None else self.with_language(keyboard)
         if file_id:
             try:
                 result = self.api.call('sendPhoto', chat_id=chat, photo=file_id,
-                    caption=text, reply_markup={'inline_keyboard': MENU})
+                    caption=caption, reply_markup={'inline_keyboard': markup})
             except APIError as exc:
                 if exc.code != 400:
                     raise
         if result is None:
-            result = self.api.photo(chat, image_path, text, MENU)
+            result = self.api.photo(chat, image_path, caption, markup)
         if result.get('photo'):
             with self.store.db:
                 self.store.put(file_key, result['photo'][-1]['file_id'])
@@ -274,58 +352,86 @@ class Bot:
         status = 'done' if history else 'active'
         total = self.store.db.execute('SELECT count(*) FROM tasks WHERE status=?', (status,)).fetchone()[0]
         page = min(page, max(0, (total-1)//8))
-        order = 'completed DESC, id DESC' if history else 'id DESC'
+        order = 'completed DESC, id DESC' if history else 'difficulty ASC, id ASC'
         rows = self.store.db.execute(f'SELECT * FROM tasks WHERE status=? ORDER BY {order} LIMIT 8 OFFSET ?', (status,page*8)).fetchall()
         if not rows:
-            self.send(chat, '📖 О дивный чистый мир\n\nЗдесь Ред запишет твои награды: сколько искр ты получила и за какое дело. Первая запись появится после выполненной задачи 🤍' if history else 'Пока нет дел. Можно записать первое — даже очень маленькое.')
+            empty_history = self.t(
+                '📖 О дивный чистый мир\n\nЗдесь Ред запишет твои награды: сколько искр ты получила и за какое дело. Первая запись появится после выполненной задачи 🤍',
+                '📖 O Brave Clean World\n\nRed will record your rewards here: how many sparks you earned and for which task. Your first entry will appear after a completed task 🤍')
+            self.send(chat, empty_history if history else self.t(
+                'Пока нет дел. Можно записать первое — даже очень маленькое.',
+                'No tasks yet. Add the first one — even something tiny.'))
             return
         keyboard = [[btn((f'✨ +{r["difficulty"]} · {r["title"][:40]}' if history else f'{r["title"][:40]} · {r["difficulty"]} ✨'), f'task:{r["id"]}')] for r in rows]
         navigation = []
         prefix = 'history' if history else 'list'
         if page:
-            navigation.append(btn('← Назад', f'{prefix}:{page-1}'))
+            navigation.append(btn(self.t('← Назад', '← Back'), f'{prefix}:{page-1}'))
         if (page+1)*8 < total:
-            navigation.append(btn('Далее →', f'{prefix}:{page+1}'))
+            navigation.append(btn(self.t('Далее →', 'Next →'), f'{prefix}:{page+1}'))
         if navigation:
             keyboard.append(navigation)
-        keyboard += [[btn('✍️ Добавить дело', 'add'), btn('🦝 Комната', 'room')]]
+        keyboard += [[btn(self.t('✍️ Добавить дело', '✍️ Add task'), 'add'),
+                      btn(self.t('🦝 Комната', '🦝 Room'), 'room')]]
         if history:
             earned = self.store.db.execute("SELECT COALESCE(sum(difficulty),0) FROM tasks WHERE status='done'").fetchone()[0]
-            text = f'📖 О дивный чистый мир\n\nТвоя история наград · {total} записей\nВсего заработано: {earned} ✨\n\nВыбери награду, чтобы вспомнить, за какое дело она получена. Потраченные искры остаются в истории.'
+            text = self.t(
+                f'📖 О дивный чистый мир\n\nТвоя история наград · {total} записей\nВсего заработано: {earned} ✨\n\nВыбери награду, чтобы вспомнить, за какое дело она получена. Потраченные искры остаются в истории.',
+                f'📖 O Brave Clean World\n\nYour reward story · {total} entries\nTotal earned: {earned} ✨\n\nChoose a reward to remember the task behind it. Spent sparks remain in the story.')
         else:
-            text = f'☑️ Мои дела · {total}\nВыбери задачу. Сложность — по твоим ощущениям.'
+            text = self.t(f'☑️ Мои дела · {total}\nЗадачи отсортированы от меньшего количества искр к большему.',
+                          f'☑️ My tasks · {total}\nTasks are sorted from the fewest sparks to the most.')
         self.send(chat, text, keyboard)
 
     def show_task(self, chat, task_id):
         row = self.store.task(task_id)
         if not row or row['status'] == 'archived':
-            self.send(chat, 'Задача уже убрана из списка.')
+            self.send(chat, self.t('Задача уже убрана из списка.', 'This task has already been removed from the list.'))
             return
         if row['status'] == 'done':
-            self.send(chat, f'📖 О дивный чистый мир\n\nНаграда: +{row["difficulty"]} ✨\nЗа дело: {row["title"]}\n\nРед бережно сохранил эту маленькую победу.', [[btn('← История наград', 'history:0'), btn('🦝 Комната', 'room')]])
+            text = self.t(
+                f'📖 О дивный чистый мир\n\nНаграда: +{row["difficulty"]} ✨\nЗа дело: {row["title"]}\n\nРед бережно сохранил эту маленькую победу.',
+                f'📖 O Brave Clean World\n\nReward: +{row["difficulty"]} ✨\nFor: {row["title"]}\n\nRed carefully saved this small victory.')
+            self.send(chat, text, [
+                [btn(self.t('↩️ Вернуть задачу', '↩️ Return task'), f'undoask:{task_id}')],
+                [btn(self.t('← История наград', '← Reward story'), 'history:0'),
+                 btn(self.t('🦝 Комната', '🦝 Room'), 'room')]])
             return
-        self.send(chat, f'{row["title"]}\n\nСложность: {LEVELS[row["difficulty"]]}', [
-            [btn('Готово ✓', f'done:{task_id}')],
-            [btn('Изменить сложность', f'level:{task_id}'), btn('Переименовать', f'rename:{task_id}')],
-            [btn('Убрать из списка', f'archiveask:{task_id}'), btn('← Мои дела', 'list:0')]])
+        self.send(chat, self.t(f'{row["title"]}\n\nСложность: {self.level_label(row["difficulty"])}',
+                               f'{row["title"]}\n\nDifficulty: {self.level_label(row["difficulty"])}'), [
+            [btn(self.t('Готово ✓', 'Done ✓'), f'done:{task_id}')],
+            [btn(self.t('Изменить сложность', 'Change difficulty'), f'level:{task_id}'),
+             btn(self.t('Переименовать', 'Rename'), f'rename:{task_id}')],
+            [btn(self.t('Убрать из списка', 'Remove from list'), f'archiveask:{task_id}'),
+             btn(self.t('← Мои дела', '← My tasks'), 'list:0')]])
 
     def difficulty(self, chat, prefix, text):
-        self.send(chat, text, [[btn(label, f'{prefix}:{value}')] for value,label in LEVELS.items()] + [[btn('Отмена', 'cancel')]])
+        levels = LEVELS_EN if self.lang == 'en' else LEVELS
+        self.send(chat, text, [[btn(label, f'{prefix}:{value}')] for value,label in levels.items()] +
+                  [[btn(self.t('Отмена', 'Cancel'), 'cancel')]])
 
     def shop(self, chat):
         stage, balance = int(self.store.get('stage')), int(self.store.get('balance'))
         earned = int(self.store.get('total_earned'))
         if stage == 3:
-            self.send(chat, 'Комната полностью обустроена 🤍\nВсе покупки останутся с тобой. Искры за новые дела продолжат копиться.')
+            self.send(chat, self.t('Комната полностью обустроена 🤍\nВсе покупки останутся с тобой. Искры за новые дела продолжат копиться.',
+                                   'The room is fully furnished 🤍\nAll purchases stay with you. Sparks from new tasks will keep accumulating.'))
             return
-        title, contents, price = UPGRADES[stage]
+        title, contents, price = (UPGRADES_EN if self.lang == 'en' else UPGRADES)[stage]
         unlocked = earned >= CLEAR_AT[stage]
-        text = f'🪴 {title}\n{contents}\n\nЦена: {price} ✨\nУ тебя: {balance} ✨\n'
-        text += (f'Участок комнаты очищен — место свободно.\n\n' if unlocked else
-                 f'Сначала рассей хаос: заработано {earned}/{CLEAR_AT[stage]} искр за реальные дела.\nОсталось: {CLEAR_AT[stage]-earned} ✨\n\n')
-        text += 'После покупки картинка комнаты обновится.'
-        keyboard = [[btn(f'Купить · {price} ✨', f'buy:{stage}')]] if unlocked else []
-        keyboard += [[btn('☑️ Мои дела','list:0'),btn('🦝 Комната','room')]]
+        if self.lang == 'en':
+            text = f'🪴 {title}\n{contents}\n\nPrice: {price} ✨\nYou have: {balance} ✨\n'
+            text += ('This area is clear — the space is ready.\n\n' if unlocked else
+                     f'Clear the chaos first: {earned}/{CLEAR_AT[stage]} sparks earned from real tasks.\nRemaining: {CLEAR_AT[stage]-earned} ✨\n\n')
+            text += 'The room image will update after purchase.'
+        else:
+            text = f'🪴 {title}\n{contents}\n\nЦена: {price} ✨\nУ тебя: {balance} ✨\n'
+            text += ('Участок комнаты очищен — место свободно.\n\n' if unlocked else
+                     f'Сначала рассей хаос: заработано {earned}/{CLEAR_AT[stage]} искр за реальные дела.\nОсталось: {CLEAR_AT[stage]-earned} ✨\n\n')
+            text += 'После покупки картинка комнаты обновится.'
+        keyboard = [[btn(self.t(f'Купить · {price} ✨', f'Buy · {price} ✨'), f'buy:{stage}')]] if unlocked else []
+        keyboard += [[btn(self.t('☑️ Мои дела', '☑️ My tasks'),'list:0'),
+                      btn(self.t('🦝 Комната', '🦝 Room'),'room')]]
         self.send(chat, text, keyboard)
 
     def handle(self, update):
@@ -337,9 +443,10 @@ class Bot:
             message = update.get('message') or {}
         if not message or not self.authorized(message):
             if callback:
-                self.api.call('answerCallbackQuery', callback_query_id=callback['id'], text='Это личный бот.')
+                self.api.call('answerCallbackQuery', callback_query_id=callback['id'], text=self.t('Это личный бот.', 'This is a private bot.'))
             elif message.get('chat', {}).get('type') == 'private':
-                self.send(message['chat']['id'], 'Это личный бот. Для первого входа используй свою ссылку привязки.', [])
+                self.send(message['chat']['id'], self.t('Это личный бот. Для первого входа используй свою ссылку привязки.',
+                                                        'This is a private bot. Use your personal pairing link for the first login.'), [])
             return
         chat = message['chat']['id']
         if callback:
@@ -351,7 +458,8 @@ class Bot:
             return self.on_callback(chat, callback.get('data', ''))
         text = message.get('text', '').strip()
         if not text:
-            self.send(chat, 'Пока я принимаю задачи текстом. Напиши, что хочешь сделать.')
+            self.send(chat, self.t('Пока я принимаю задачи текстом. Напиши, что хочешь сделать.',
+                                   'For now I accept tasks as text. Tell me what you want to do.'))
             return
         command = text.split()[0].split('@')[0]
         if command in ('/start','/room'):
@@ -365,42 +473,53 @@ class Bot:
             self.shop(chat)
         elif command == '/cancel':
             self.store.cancel()
-            self.send(chat, 'Отменено. Можно начать заново в любое время.')
+            self.send(chat, self.t('Отменено. Можно начать заново в любое время.', 'Cancelled. You can start again at any time.'))
+        elif command == '/language':
+            self.send(chat, self.t('Выбери язык интерфейса.', 'Choose the interface language.'),
+                      [[btn('Русский', 'lang:ru'), btn('English', 'lang:en')]])
         elif command == '/help':
-            self.send(chat, 'Напиши задачу → выбери сложность → отметь выполнение → получи искры.\n\n'
-                '1 / 3 / 7 / 12 искр — по твоим ощущениям. Время не измеряется.\n'
-                'В активной задаче можно изменить название и сложность.\n'
-                'Повторное нажатие «Готово» не начисляет искры ещё раз.\n'
-                'Нет штрафов и обязательных ежедневных серий.\n\n'
-                '/room — комната\n/add — новое дело\n/tasks — мои дела\n/shop — покупки\n/cancel — отменить ввод')
+            self.send(chat, self.t(
+                'Напиши задачу → выбери сложность → отметь выполнение → получи искры.\n\n1 / 3 / 7 / 12 искр — по твоим ощущениям. Время не измеряется.\nВ активной задаче можно изменить название и сложность. Выполненную задачу можно вернуть: хаос и награда откатятся, а мебель останется.\nНет штрафов и обязательных ежедневных серий.\n\n/room — комната\n/add — новое дело\n/tasks — мои дела\n/shop — покупки\n/language — язык\n/cancel — отменить ввод',
+                'Write a task → choose difficulty → mark it done → earn sparks.\n\n1 / 3 / 7 / 12 sparks — based on how it feels to you. Time is not measured.\nYou can rename an active task or change its difficulty. A completed task can be returned: chaos and its reward roll back, while furniture stays.\nNo penalties or mandatory daily streaks.\n\n/room — room\n/add — new task\n/tasks — my tasks\n/shop — purchases\n/language — language\n/cancel — cancel input'))
         elif command.startswith('/'):
-            self.send(chat, 'Не знаю эту команду. Нажми кнопку ниже или /help.')
+            self.send(chat, self.t('Не знаю эту команду. Нажми кнопку ниже или /help.',
+                                   "I don't know this command. Use a button below or /help."))
         else:
             if len(text) > 250:
-                self.send(chat, 'Сократи название до 250 символов — так оно поместится в карточку.')
+                self.send(chat, self.t('Сократи название до 250 символов — так оно поместится в карточку.',
+                                       'Shorten the name to 250 characters so it fits on the card.'))
                 return
             draft = self.store.draft()
             if draft and draft['kind'].startswith('rename:'):
                 changed = self.store.rename(int(draft['kind'].split(':')[1]), text)
-                self.send(chat, 'Название обновлено.' if changed else 'Эта задача уже закрыта.')
+                self.send(chat, self.t('Название обновлено.' if changed else 'Эта задача уже закрыта.',
+                                       'Name updated.' if changed else 'This task is already closed.'))
             else:
                 nonce = self.store.begin_draft(text, 'difficulty')
-                self.difficulty(chat, f'new:{nonce}', f'«{text}»\n\nНасколько это сложно для тебя?')
+                self.difficulty(chat, f'new:{nonce}', self.t(f'«{text}»\n\nНасколько это сложно для тебя?',
+                                                            f'“{text}”\n\nHow difficult does this feel?'))
 
     def add(self, chat):
         self.store.begin_draft()
-        self.send(chat, 'Какое дело хочешь записать?\nНапиши одним сообщением. Например: «Разобрать одну полку».', [[btn('Отмена','cancel')]])
+        self.send(chat, self.t('Какое дело хочешь записать?\nНапиши одним сообщением. Например: «Разобрать одну полку».',
+                               'What task do you want to add?\nSend it in one message. For example: “Clear one shelf.”'),
+                  [[btn(self.t('Отмена', 'Cancel'),'cancel')]])
 
     def on_callback(self, chat, data):
         parts = data.split(':')
         action = parts[0]
         if data == 'room':
             self.room(chat)
+        elif data in ('lang:ru', 'lang:en'):
+            with self.store.db:
+                self.store.put('language', data.split(':')[1])
+            self.update_commands()
+            self.room(chat)
         elif data == 'add':
             self.add(chat)
         elif data == 'cancel':
             self.store.cancel()
-            self.send(chat, 'Отменено. Ред никуда не торопится 🤍')
+            self.send(chat, self.t('Отменено. Ред никуда не торопится 🤍', 'Cancelled. Red is in no hurry 🤍'))
         elif data == 'shop':
             self.shop(chat)
         elif len(parts) == 3 and action == 'new' and parts[2].isdigit():
@@ -408,7 +527,8 @@ class Bot:
             if task_id:
                 self.show_task(chat, task_id)
             else:
-                self.send(chat, 'Эта карточка уже обработана или заменена. Открой «Мои дела».')
+                self.send(chat, self.t('Эта карточка уже обработана или заменена. Открой «Мои дела».',
+                                       'This card was already handled or replaced. Open “My tasks”.'))
         elif len(parts) >= 2 and parts[1].isdigit():
             number = int(parts[1])
             if action in ('list','history'):
@@ -420,30 +540,57 @@ class Bot:
                 reward = self.store.finish(number)
                 if reward:
                     after = int(self.store.get('chaos_remaining'))
-                    cache = Path(os.environ.get('MEDIA_CACHE', str(ROOT/'data'/'media_cache')))
-                    animation = cache/f'chaos-{int(self.store.get("stage"))}-{before}-{after}.gif'
-                    try:
-                        if not animation.exists():
-                            render_transition(int(self.store.get('stage')), before, after, reward, animation)
-                        self.api.animation(chat, animation)
-                    except (APIError, OSError, ValueError) as exc:
-                        logging.warning('Не удалось отправить анимацию хаоса: %s', type(exc).__name__)
-                    phrase = AFTER_MESSAGES[number % len(AFTER_MESSAGES)]
+                    phrase = (AFTER_MESSAGES if self.lang == 'en' else AFTER_MESSAGES_RU)[number % len(AFTER_MESSAGES)]
                     cleared_before, cleared_after = CHAOS_TOTAL-before, CHAOS_TOTAL-after
                     unlocked = [i for i,t in enumerate(CLEAR_AT) if cleared_before < t <= cleared_after]
                     extra = ''
                     if unlocked:
-                        title = UPGRADES[unlocked[-1]][0]
-                        extra = f'\n\n🌟 Участок хаоса исчез полностью. Открыто улучшение «{title}».'
-                    self.send(chat, f'{phrase}\n\n✨ +{reward} искр! Хаос уменьшился на {reward}.\nРед записал награду в «О дивный чистый мир» / “O Brave Clean World”.\nБаланс: {self.store.get("balance")} ✨{extra}\n\nМожно закончить на сегодня.')
+                        title = (UPGRADES_EN if self.lang == 'en' else UPGRADES)[unlocked[-1]][0]
+                        extra = self.t(f'\n\n🌟 Участок хаоса исчез полностью. Открыто улучшение «{title}».',
+                                       f'\n\n🌟 A section of chaos vanished completely. “{title}” is now unlocked.')
+                    completion = self.t(
+                        f'{phrase}\n\n✨ +{reward} искр! Хаос уменьшился на {reward}.\nРед записал награду в «О дивный чистый мир».\nБаланс: {self.store.get("balance")} ✨{extra}\n\nМожно закончить на сегодня.',
+                        f'{phrase}\n\n✨ +{reward} sparks! Chaos decreased by {reward}.\nRed recorded the reward in “O Brave Clean World”.\nBalance: {self.store.get("balance")} ✨{extra}\n\nYou can stop for today.')
+                    self.send_room_photo(chat, completion, int(self.store.get('stage')), after,
+                                         [[btn(self.t('☑️ Мои дела', '☑️ My tasks'), 'list:0'),
+                                           btn(self.t('🦝 Комната', '🦝 Room'), 'room')]])
                 else:
-                    self.send(chat, 'Эта задача уже закрыта. Награда повторно не списывается и не начисляется.')
+                    self.send(chat, self.t('Эта задача уже закрыта. Награда повторно не списывается и не начисляется.',
+                                           'This task is already closed. Its reward cannot be added twice.'))
+            elif action == 'undoask':
+                row = self.store.task(number)
+                if row and row['status'] == 'done':
+                    self.send(chat, self.t(
+                        f'Вернуть задачу «{row["title"]}»?\n\n{row["difficulty"]} искр будут отменены, хаос увеличится обратно. Уже купленная мебель и этап комнаты останутся.',
+                        f'Return “{row["title"]}”?\n\n{row["difficulty"]} sparks will be reversed and the chaos will grow back. Purchased furniture and the room stage will stay.'),
+                        [[btn(self.t('Да, вернуть', 'Yes, return it'), f'undo:{number}'),
+                          btn(self.t('Оставить выполненной', 'Keep completed'), f'task:{number}')]])
+                else:
+                    self.send(chat, self.t('Эта задача уже возвращена.', 'This task has already been returned.'))
+            elif action == 'undo':
+                reward = self.store.undo(number)
+                if reward:
+                    chaos = int(self.store.get('chaos_remaining'))
+                    debt = int(self.store.get('undo_debt', '0'))
+                    debt_note = self.t(
+                        f'\nСледующие {debt} ✨ сначала восстановят отменённую награду.' if debt else '',
+                        f'\nThe next {debt} ✨ will first restore the reversed reward.' if debt else '')
+                    caption = self.t(
+                        f'↩️ Задача возвращена в активные.\nХаос увеличился на {reward}. Мебель и обустройство не изменились.{debt_note}',
+                        f'↩️ The task is active again.\nChaos increased by {reward}. Furniture and furnishing did not change.{debt_note}')
+                    self.send_room_photo(chat, caption, int(self.store.get('stage')), chaos,
+                                         [[btn(self.t('Открыть задачу', 'Open task'), f'task:{number}'),
+                                           btn(self.t('☑️ Мои дела', '☑️ My tasks'), 'list:0')]])
+                else:
+                    self.send(chat, self.t('Эту задачу уже нельзя вернуть повторно.', 'This task cannot be returned again.'))
             elif action == 'level':
                 row = self.store.task(number)
                 if row and row['status'] == 'active':
-                    self.difficulty(chat, f'edit:{number}', 'Выбери новую сложность. Награда изменится до выполнения.')
+                    self.difficulty(chat, f'edit:{number}', self.t('Выбери новую сложность. Награда изменится до выполнения.',
+                                                                  'Choose a new difficulty. The reward changes before completion.'))
                 else:
-                    self.send(chat, 'Сложность закрытой задачи уже не меняется.')
+                    self.send(chat, self.t('Сложность закрытой задачи уже не меняется.',
+                                           'The difficulty of a closed task cannot be changed.'))
             elif action == 'edit' and len(parts) == 3 and parts[2].isdigit():
                 self.store.change_difficulty(number, int(parts[2]))
                 self.show_task(chat, number)
@@ -451,11 +598,15 @@ class Bot:
                 row = self.store.task(number)
                 if row and row['status'] == 'active':
                     self.store.begin_draft(kind=f'rename:{number}')
-                    self.send(chat, 'Напиши новое название задачи.', [[btn('Отмена','cancel')]])
+                    self.send(chat, self.t('Напиши новое название задачи.', 'Send the new task name.'),
+                              [[btn(self.t('Отмена', 'Cancel'),'cancel')]])
                 else:
-                    self.send(chat, 'Эта задача уже закрыта.')
+                    self.send(chat, self.t('Эта задача уже закрыта.', 'This task is already closed.'))
             elif action == 'archiveask':
-                self.send(chat, 'Убрать задачу из активных? Искры не изменятся.', [[btn('Да, убрать',f'archive:{number}'),btn('Оставить',f'task:{number}')]])
+                self.send(chat, self.t('Убрать задачу из активных? Искры не изменятся.',
+                                       'Remove this task from the active list? Sparks will not change.'),
+                          [[btn(self.t('Да, убрать', 'Yes, remove'),f'archive:{number}'),
+                            btn(self.t('Оставить', 'Keep it'),f'task:{number}')]])
             elif action == 'archive':
                 self.store.archive(number)
                 self.show_tasks(chat)
@@ -464,15 +615,18 @@ class Bot:
                 if result == 'ok':
                     self.room(chat)
                 elif result == 'poor':
-                    self.send(chat, 'Пока не хватает искр. Ничего не списано — можно вернуться позже.')
+                    self.send(chat, self.t('Пока не хватает искр. Ничего не списано — можно вернуться позже.',
+                                           'Not enough sparks yet. Nothing was spent — you can return later.'))
                 elif result == 'locked':
-                    self.send(chat, 'Это место ещё скрыто хаосом. Выполни несколько реальных дел — искры постепенно освободят его.')
+                    self.send(chat, self.t('Это место ещё скрыто хаосом. Выполни несколько реальных дел — искры постепенно освободят его.',
+                                           'This space is still hidden by chaos. Complete a few real tasks and sparks will gradually clear it.'))
                 else:
-                    self.send(chat, 'Этот этап уже куплен или ещё не открыт.')
+                    self.send(chat, self.t('Этот этап уже куплен или ещё не открыт.',
+                                           'This stage is already purchased or not yet available.'))
             else:
-                self.send(chat, 'Открой актуальное меню ниже.')
+                self.send(chat, self.t('Открой актуальное меню ниже.', 'Use the current menu below.'))
         else:
-            self.send(chat, 'Открой актуальное меню ниже.')
+            self.send(chat, self.t('Открой актуальное меню ниже.', 'Use the current menu below.'))
 
 
 def main():
@@ -499,9 +653,7 @@ def main():
         webhook = api.call('getWebhookInfo')
         if webhook.get('url'):
             raise SystemExit('У бота уже настроен webhook. Используй нового бота или отключи webhook осознанно перед запуском.')
-        api.call('setMyCommands', commands=[{'command':c,'description':d} for c,d in [
-            ('start','Моя комната'),('add','Добавить дело'),('tasks','Мои дела'),
-            ('shop','Обустроить комнату'),('cancel','Отменить ввод'),('help','Как всё работает')]])
+        bot.update_commands()
         logging.info('Zero Space запущен. Для остановки нажми Ctrl+C.')
         while running:
             try:
