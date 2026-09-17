@@ -20,7 +20,10 @@ def _ease(value: float) -> float:
 
 
 def _room(stage: int, size: int) -> Image.Image:
-    image = Image.open(ASSETS / ROOMS[max(0, min(3, stage))]).convert('RGB')
+    # Ten collectible rewards are grouped into four large visual room states.
+    # The exact reward progress remains visible in the bot's room and shop text.
+    visual_stage = 0 if stage <= 0 else 1 if stage <= 4 else 2 if stage <= 7 else 3
+    image = Image.open(ASSETS / ROOMS[visual_stage]).convert('RGB')
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 

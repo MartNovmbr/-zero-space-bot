@@ -21,17 +21,31 @@ LEVELS = {1: 'Совсем легко · 1 ✨', 3: 'Легко · 3 ✨',
 LEVELS_EN = {1: 'Very easy · 1 ✨', 3: 'Easy · 3 ✨',
              7: 'Medium · 7 ✨', 12: 'Hard · 12 ✨'}
 UPGRADES = [
-    ('Первый уют', 'Ковёр и растение', 18),
-    ('Больше света', 'Окно и льняные шторы', 53),
-    ('Кабинет писателя', 'Обои, красивая дверь, кресло и письменный стол с книгами', 95),
+    ('Красивое зеркало', 'Небольшое зеркало в светлой деревянной раме', 1),
+    ('Ботаническая картина', 'Нежная картина с листьями для стены Реда', 1),
+    ('Красивая люстра', 'Тёплый мягкий свет для уютных вечеров', 3),
+    ('Плед и подушка', 'Мягкий текстиль в спокойных скандинавских оттенках', 3),
+    ('Скандинавский ковёр', 'Светлый фактурный ковёр из натуральных материалов', 5),
+    ('Зелёное растение', 'Большое живое растение в керамическом кашпо', 5),
+    ('Льняные шторы', 'Светлые шторы, которые красиво пропускают солнце', 7),
+    ('Книжные полки', 'Полки для любимых книг и заметок писателя', 8),
+    ('Кресло для чтения', 'Мягкое кресло с уютным пледом', 10),
+    ('Письменный стол Реда', 'Стол, стул, лампа и всё необходимое для новой истории', 12),
 ]
 UPGRADES_EN = [
-    ('First comfort', 'A rug and a plant', 18),
-    ('More light', 'A window and linen curtains', 53),
-    ("The writer's study", 'Wallpaper, a beautiful door, an armchair, a writing desk and books', 95),
+    ('Beautiful mirror', 'A small mirror in a light wooden frame', 1),
+    ('Botanical picture', 'A delicate leafy print for Red’s wall', 1),
+    ('Beautiful chandelier', 'Warm, gentle light for cozy evenings', 3),
+    ('Throw and cushion', 'Soft textiles in calm Scandinavian shades', 3),
+    ('Scandinavian rug', 'A light textured rug made from natural materials', 5),
+    ('Green plant', 'A large living plant in a ceramic pot', 5),
+    ('Linen curtains', 'Light curtains that let the sunshine through', 7),
+    ('Bookshelves', 'Shelves for a writer’s favorite books and notes', 8),
+    ('Reading armchair', 'A soft armchair with a cozy throw', 10),
+    ("Red's writing desk", 'A desk, chair, lamp and everything needed for a new story', 12),
 ]
 IMAGES = ['00-empty.png', '01-cozy.png', '02-window.png', '03-finished.png']
-CLEAR_AT = [18, 71, 166]
+CLEAR_AT = [1, 2, 5, 8, 13, 18, 25, 33, 43, 55]
 AFTER_MESSAGES = [
     'Chaos fades.', 'A little more light.', 'The room can breathe again.',
     'The chaos thins. The story continues.', 'A cleaner room, a brighter chapter.'
@@ -133,6 +147,12 @@ class Store:
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO meta VALUES('total_earned',?)", (str(earned),))
             self.db.execute("INSERT OR IGNORE INTO meta VALUES('chaos_remaining',?)", (str(max(0, CHAOS_TOTAL-earned)),))
+            if not self.get('upgrade_catalog_version'):
+                # v0.4 had three bundles. Preserve their equivalent room progress
+                # when the ten-item v0.5 catalog is opened for the first time.
+                old_stage = int(self.get('stage', '0'))
+                self.put('stage', {1: 4, 2: 7, 3: 10}.get(old_stage, old_stage))
+                self.put('upgrade_catalog_version', 2)
 
     def get(self, key, default=''):
         row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
@@ -222,6 +242,37 @@ class Store:
         with self.db:
             return self.db.execute("UPDATE tasks SET status='archived' WHERE id=? AND status='active'", (task_id,)).rowcount == 1
 
+    def begin_reset(self):
+        """Create a short-lived, one-time confirmation for a full progress reset."""
+        nonce = secrets.token_hex(6)
+        with self.db:
+            self.put('reset_nonce', nonce)
+            self.put('reset_expires', int(time.time()) + 10 * 60)
+        return nonce
+
+    def cancel_reset(self):
+        with self.db:
+            self.db.execute("DELETE FROM meta WHERE key IN ('reset_nonce','reset_expires')")
+
+    def reset_progress(self, nonce):
+        """Erase game progress while preserving the owner, language and bot offset."""
+        expected = self.get('reset_nonce')
+        expires = int(self.get('reset_expires', '0') or '0')
+        if not expected or not hmac.compare_digest(expected, nonce) or time.time() > expires:
+            return False
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            # Do not reset SQLite task IDs: buttons in older Telegram messages must
+            # never point at a newly-created task after the reset.
+            self.db.execute('DELETE FROM tasks')
+            self.db.execute('DELETE FROM draft')
+            for key, value in (
+                    ('balance', 0), ('stage', 0), ('undo_debt', 0),
+                    ('total_earned', 0), ('chaos_remaining', CHAOS_TOTAL)):
+                self.put(key, value)
+            self.db.execute("DELETE FROM meta WHERE key IN ('reset_nonce','reset_expires')")
+        return True
+
     def buy(self, stage):
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
@@ -262,7 +313,8 @@ class Bot:
                  btn(self.t('✍️ Добавить дело', '✍️ Add task'), 'add')],
                 [btn(self.t('☑️ Мои дела', '☑️ My tasks'), 'list:0'),
                  btn(self.t('🪴 Обустроить', '🪴 Furnish'), 'shop')],
-                [btn(self.t('📖 О дивный чистый мир', '📖 O Brave Clean World'), 'history:0')]]
+                [btn(self.t('📖 О дивный чистый мир', '📖 O Brave Clean World'), 'history:0')],
+                [btn(self.t('↻ Обнулить прогресс', '↻ Reset progress'), 'resetask')]]
         return self.with_language(rows)
 
     def update_commands(self):
@@ -271,6 +323,7 @@ class Bot:
             ('add', self.t('Добавить дело', 'Add a task')),
             ('tasks', self.t('Мои дела', 'My tasks')),
             ('shop', self.t('Обустроить комнату', 'Furnish the room')),
+            ('reset', self.t('Обнулить прогресс', 'Reset progress')),
             ('language', self.t('Русский / English', 'Русский / English')),
             ('cancel', self.t('Отменить ввод', 'Cancel input')),
             ('help', self.t('Как всё работает', 'How it works')),
@@ -313,15 +366,15 @@ class Bot:
         count = self.store.db.execute("SELECT count(*) FROM tasks WHERE status='done'").fetchone()[0]
         if self.lang == 'en':
             text = (f'ZERO SPACE\nClean. Create. Continue the story.\n\n🦝 Red the raccoon writer’s room\n\n'
-                    f'✨ Sparks: {balance}\nRewards in your story: {count}\nFurnishing: {stage}/3\n\n'
+                    f'✨ Sparks: {balance}\nRewards in your story: {count}\nRoom rewards: {stage}/{len(UPGRADES)}\n\n'
                     f'🌫 Chaos cleared: {round(cleared/CHAOS_TOTAL*100)}% · {chaos}/{CHAOS_TOTAL} remains\n\n')
-            text += ("Red now has his own writing corner. A new chapter begins with you 🤍" if stage == 3 else
+            text += ("Red now has his own writing corner. A new chapter begins with you 🤍" if stage == len(UPGRADES) else
                      'Even one tiny task is a new line in our story. Red is happy to see you, even after a break.')
         else:
             text = (f'ZERO SPACE\nClean. Create. Continue the story.\n\n🦝 Комната енота-писателя Реда\n\n'
-                    f'✨ Искры: {balance}\nНаград в твоей истории: {count}\nОбустройство: {stage}/3\n\n'
+                    f'✨ Искры: {balance}\nНаград в твоей истории: {count}\nНаграды комнаты: {stage}/{len(UPGRADES)}\n\n'
                     f'🌫 Хаос рассеян на {round(cleared/CHAOS_TOTAL*100)}% · осталось {chaos}/{CHAOS_TOTAL}\n\n')
-            text += ('Теперь у Реда есть свой писательский уголок. Новая глава начинается с тебя 🤍' if stage == 3 else
+            text += ('Теперь у Реда есть свой писательский уголок. Новая глава начинается с тебя 🤍' if stage == len(UPGRADES) else
                      'Даже одно маленькое дело — новая строчка в нашей истории. Ред рад тебе и после перерыва.')
         self.send_room_photo(chat, text, stage, chaos)
 
@@ -413,19 +466,28 @@ class Bot:
     def shop(self, chat):
         stage, balance = int(self.store.get('stage')), int(self.store.get('balance'))
         earned = int(self.store.get('total_earned'))
-        if stage == 3:
-            self.send(chat, self.t('Комната полностью обустроена 🤍\nВсе покупки останутся с тобой. Искры за новые дела продолжат копиться.',
-                                   'The room is fully furnished 🤍\nAll purchases stay with you. Sparks from new tasks will keep accumulating.'))
+        catalog = UPGRADES_EN if self.lang == 'en' else UPGRADES
+        lines = []
+        for index, (item_title, _, item_price) in enumerate(catalog):
+            marker = '✅' if index < stage else ('➡️' if index == stage else '🔒')
+            lines.append(f'{marker} {index+1}. {item_title} · {item_price} ✨')
+        catalog_text = '\n'.join(lines)
+        if stage == len(UPGRADES):
+            self.send(chat, self.t(
+                f'🪴 Награды комнаты · {stage}/{len(UPGRADES)}\n\n{catalog_text}\n\nКомната полностью обустроена 🤍\nВсе покупки останутся с тобой. Искры за новые дела продолжат копиться.',
+                f'🪴 Room rewards · {stage}/{len(UPGRADES)}\n\n{catalog_text}\n\nThe room is fully furnished 🤍\nAll purchases stay with you. Sparks from new tasks will keep accumulating.'))
             return
-        title, contents, price = (UPGRADES_EN if self.lang == 'en' else UPGRADES)[stage]
+        title, contents, price = catalog[stage]
         unlocked = earned >= CLEAR_AT[stage]
         if self.lang == 'en':
-            text = f'🪴 {title}\n{contents}\n\nPrice: {price} ✨\nYou have: {balance} ✨\n'
+            text = (f'🪴 Room rewards · {stage}/{len(UPGRADES)}\n\n{catalog_text}\n\n'
+                    f'Next: {title}\n{contents}\n\nPrice: {price} ✨\nYou have: {balance} ✨\n')
             text += ('This area is clear — the space is ready.\n\n' if unlocked else
                      f'Clear the chaos first: {earned}/{CLEAR_AT[stage]} sparks earned from real tasks.\nRemaining: {CLEAR_AT[stage]-earned} ✨\n\n')
             text += 'The room image will update after purchase.'
         else:
-            text = f'🪴 {title}\n{contents}\n\nЦена: {price} ✨\nУ тебя: {balance} ✨\n'
+            text = (f'🪴 Награды комнаты · {stage}/{len(UPGRADES)}\n\n{catalog_text}\n\n'
+                    f'Следующая награда: {title}\n{contents}\n\nЦена: {price} ✨\nУ тебя: {balance} ✨\n')
             text += ('Участок комнаты очищен — место свободно.\n\n' if unlocked else
                      f'Сначала рассей хаос: заработано {earned}/{CLEAR_AT[stage]} искр за реальные дела.\nОсталось: {CLEAR_AT[stage]-earned} ✨\n\n')
             text += 'После покупки картинка комнаты обновится.'
@@ -433,6 +495,14 @@ class Bot:
         keyboard += [[btn(self.t('☑️ Мои дела', '☑️ My tasks'),'list:0'),
                       btn(self.t('🦝 Комната', '🦝 Room'),'room')]]
         self.send(chat, text, keyboard)
+
+    def ask_reset(self, chat):
+        nonce = self.store.begin_reset()
+        self.send(chat, self.t(
+            'Начать историю заново?\n\nБудут удалены все задачи и записи в «О дивный чистый мир». Комната снова станет пустой, хаос вернётся полностью, а баланс будет равен 0 ✨\n\nЭто действие нельзя отменить. Привязка бота и выбранный язык сохранятся.',
+            'Start the story again?\n\nAll tasks and entries in “O Brave Clean World” will be deleted. The room will become empty again, all chaos will return, and the balance will be 0 ✨\n\nThis cannot be undone. Your bot connection and selected language will remain.'),
+            [[btn(self.t('Да, начать заново', 'Yes, start again'), f'resetconfirm:{nonce}'),
+              btn(self.t('Нет, оставить всё', 'No, keep everything'), 'resetcancel')]])
 
     def handle(self, update):
         callback = update.get('callback_query')
@@ -471,6 +541,8 @@ class Bot:
             self.show_tasks(chat)
         elif command == '/shop':
             self.shop(chat)
+        elif command == '/reset':
+            self.ask_reset(chat)
         elif command == '/cancel':
             self.store.cancel()
             self.send(chat, self.t('Отменено. Можно начать заново в любое время.', 'Cancelled. You can start again at any time.'))
@@ -479,8 +551,8 @@ class Bot:
                       [[btn('Русский', 'lang:ru'), btn('English', 'lang:en')]])
         elif command == '/help':
             self.send(chat, self.t(
-                'Напиши задачу → выбери сложность → отметь выполнение → получи искры.\n\n1 / 3 / 7 / 12 искр — по твоим ощущениям. Время не измеряется.\nВ активной задаче можно изменить название и сложность. Выполненную задачу можно вернуть: хаос и награда откатятся, а мебель останется.\nНет штрафов и обязательных ежедневных серий.\n\n/room — комната\n/add — новое дело\n/tasks — мои дела\n/shop — покупки\n/language — язык\n/cancel — отменить ввод',
-                'Write a task → choose difficulty → mark it done → earn sparks.\n\n1 / 3 / 7 / 12 sparks — based on how it feels to you. Time is not measured.\nYou can rename an active task or change its difficulty. A completed task can be returned: chaos and its reward roll back, while furniture stays.\nNo penalties or mandatory daily streaks.\n\n/room — room\n/add — new task\n/tasks — my tasks\n/shop — purchases\n/language — language\n/cancel — cancel input'))
+                'Напиши задачу → выбери сложность → отметь выполнение → получи искры.\n\n1 / 3 / 7 / 12 искр — по твоим ощущениям. Время не измеряется.\nВ активной задаче можно изменить название и сложность. Выполненную задачу можно вернуть: хаос и награда откатятся, а мебель останется.\nНет штрафов и обязательных ежедневных серий.\n\n/room — комната\n/add — новое дело\n/tasks — мои дела\n/shop — покупки\n/reset — начать историю заново\n/language — язык\n/cancel — отменить ввод',
+                'Write a task → choose difficulty → mark it done → earn sparks.\n\n1 / 3 / 7 / 12 sparks — based on how it feels to you. Time is not measured.\nYou can rename an active task or change its difficulty. A completed task can be returned: chaos and its reward roll back, while furniture stays.\nNo penalties or mandatory daily streaks.\n\n/room — room\n/add — new task\n/tasks — my tasks\n/shop — purchases\n/reset — start the story again\n/language — language\n/cancel — cancel input'))
         elif command.startswith('/'):
             self.send(chat, self.t('Не знаю эту команду. Нажми кнопку ниже или /help.',
                                    "I don't know this command. Use a button below or /help."))
@@ -522,6 +594,24 @@ class Bot:
             self.send(chat, self.t('Отменено. Ред никуда не торопится 🤍', 'Cancelled. Red is in no hurry 🤍'))
         elif data == 'shop':
             self.shop(chat)
+        elif data == 'resetask':
+            self.ask_reset(chat)
+        elif data == 'resetcancel':
+            self.store.cancel_reset()
+            self.send(chat, self.t('Ничего не изменилось. История продолжается 🤍',
+                                   'Nothing changed. The story continues 🤍'))
+        elif len(parts) == 2 and action == 'resetconfirm':
+            if self.store.reset_progress(parts[1]):
+                caption = self.t(
+                    'История начинается заново 🤍\n\nКомната снова пустая, баланс — 0 ✨, а мягкий хаос вернулся полностью. Когда будешь готова, добавь первое маленькое дело.',
+                    'The story begins again 🤍\n\nThe room is empty, the balance is 0 ✨, and the soft chaos has fully returned. When you are ready, add the first small task.')
+                self.send_room_photo(chat, caption, 0, CHAOS_TOTAL,
+                    [[btn(self.t('✍️ Добавить первое дело', '✍️ Add the first task'), 'add'),
+                      btn(self.t('🦝 Пустая комната', '🦝 Empty room'), 'room')]])
+            else:
+                self.send(chat, self.t(
+                    'Подтверждение устарело. Ничего не изменилось — нажми «Обнулить прогресс» ещё раз, если всё ещё хочешь начать заново.',
+                    'This confirmation has expired. Nothing changed — tap “Reset progress” again if you still want to start over.'))
         elif len(parts) == 3 and action == 'new' and parts[2].isdigit():
             task_id = self.store.create_task(parts[1], int(parts[2]))
             if task_id:
