@@ -1,0 +1,11 @@
+services:
+  zero-space:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/domik.sqlite3
+      MEDIA_CACHE: /app/data/media_cache
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 80s
