@@ -765,4 +765,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from app_server import main as run_mini_app
+    run_mini_app()
