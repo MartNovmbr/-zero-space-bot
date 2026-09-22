@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -14,6 +15,16 @@ from bot import Telegram, APIError, Store, Bot, load_env
 
 ROOT = Path(__file__).resolve().parent
 CATEGORIES = ('bed','bath','hall','kitchen','balcony','sale','home','finance','shopping','documents')
+DEFAULT_NAMES = ('Bedroom','Bathroom','Entryway','Kitchen','Balcony','Selling','Utilities','Finances','Shopping','Documents')
+DEFAULT_ICONS = ('bed-double','bath','coat','cooking-pot','panels-top-left','coins','house','credit-card','shopping-cart','book-user')
+
+def ensure_categories(db):
+    db.execute('CREATE TABLE IF NOT EXISTS categories(id TEXT PRIMARY KEY,name TEXT NOT NULL,icon TEXT NOT NULL,position INTEGER NOT NULL)')
+    for pos, (key, name, icon) in enumerate(zip(CATEGORIES, DEFAULT_NAMES, DEFAULT_ICONS)):
+        db.execute('INSERT OR IGNORE INTO categories VALUES(?,?,?,?)',(key,name,icon,pos))
+
+def category_state(db):
+    return [dict(zip(('id','name','icon','position'), row)) for row in db.execute('SELECT id,name,icon,position FROM categories ORDER BY position,id')]
 
 def initialize(path):
     # Same database and owner as previous releases. Reset only once, atomically.
@@ -21,12 +32,7 @@ def initialize(path):
     with old.db:
         old.db.execute('CREATE TABLE IF NOT EXISTS steps(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, category TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)')
         old.db.execute('CREATE TABLE IF NOT EXISTS app_requests(id TEXT PRIMARY KEY)')
-        if old.get('pearl_v1_reset') != '1':
-            old.db.execute('DELETE FROM tasks')
-            old.db.execute('DELETE FROM draft')
-            old.db.execute('DELETE FROM steps')
-            old.db.execute("DELETE FROM meta WHERE key NOT IN ('owner','language','offset')")
-            old.put('pearl_v1_reset', '1')
+        ensure_categories(old.db)
     old.db.close()
 
 def authenticate(raw, token, owner, now=None):
@@ -49,6 +55,7 @@ def authenticate(raw, token, owner, now=None):
     return user
 
 def mutate(db, data):
+    ensure_categories(db)
     op = data.get('op')
     if op == 'state':
         return
@@ -61,7 +68,7 @@ def mutate(db, data):
         title = data.get('title', '')
         if not isinstance(title, str) or not 1 <= len(title.strip()) <= 80:
             raise ValueError('Task must contain 1 to 80 characters')
-        if data.get('category') not in CATEGORIES:
+        if not db.execute('SELECT 1 FROM categories WHERE id=?',(data.get('category'),)).fetchone():
             raise ValueError('Choose a category')
         if op == 'create':
             db.execute('INSERT INTO steps(title,category) VALUES(?,?)', (title.strip(), data['category']))
@@ -73,6 +80,24 @@ def mutate(db, data):
         cur = db.execute('UPDATE steps SET done=? WHERE id=?', (int(op=='complete'), data.get('id')))
         if not cur.rowcount:
             raise ValueError('Task was deleted')
+    elif op == 'delete':
+        db.execute('DELETE FROM steps WHERE id=?',(data.get('id'),))
+    elif op == 'category_create':
+        name = data.get('name','')
+        if not isinstance(name,str) or not 1 <= len(name.strip()) <= 40:
+            raise ValueError('Category must contain 1 to 40 characters')
+        name = name.strip()
+        if any(row[0].casefold()==name.casefold() for row in db.execute('SELECT name FROM categories')):
+            raise ValueError('This category already exists')
+        position = db.execute('SELECT COALESCE(MAX(position),-1)+1 FROM categories').fetchone()[0]
+        db.execute('INSERT INTO categories VALUES(?,?,?,?)',('custom_'+uuid.uuid4().hex,name,'tag',position))
+    elif op == 'category_order':
+        order = data.get('order')
+        ids = {r[0] for r in db.execute('SELECT id FROM categories')}
+        if not isinstance(order,list) or any(not isinstance(x,str) for x in order) or len(order)!=len(ids) or set(order)!=ids:
+            raise ValueError('Categories changed. Reopen the order editor')
+        for pos,key in enumerate(order):
+            db.execute('UPDATE categories SET position=? WHERE id=?',(pos,key))
     elif op == 'clear':
         db.execute('DELETE FROM steps WHERE done=1')
     else:
@@ -127,7 +152,8 @@ def make_handler(path, token, allowed, extra=()):
                     db.execute('BEGIN IMMEDIATE')
                     mutate(db, data)
                     result = [dict(row) for row in db.execute('SELECT * FROM steps ORDER BY id')]
-                self.reply(200, {'tasks':result})
+                    categories = category_state(db)
+                self.reply(200, {'tasks':result,'categories':categories})
             except (ValueError, TypeError, KeyError) as exc:
                 self.reply(400, {'error':str(exc)})
             except Exception:
@@ -164,7 +190,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     api.call('setMyCommands', commands=[{'command':'start','description':'Open Pearly'},{'command':'id','description':'Show my Telegram ID'}])
     api.call('setChatMenuButton', menu_button={'type':'web_app','text':'Open','web_app':{'url':url}})
-    print('Pearly v2 ready', flush=True)
+    print('Pearly v3 ready', flush=True)
     while True:
         try:
             updates = api.call('getUpdates', offset=int(store.get('offset','0')), timeout=30, allowed_updates=['message','callback_query'])
@@ -186,4 +212,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
