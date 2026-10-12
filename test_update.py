@@ -30,10 +30,10 @@ class UpdateTests(unittest.TestCase):
         with self.db:
             mutate(self.db,dict(op=op,request_id=str(fields),**fields))
 
-    def test_reset_once_owner_preserved(self):
-        self.assertEqual(self.db.execute('SELECT count(*) FROM tasks').fetchone()[0],0)
+    def test_initialize_preserves_existing_bot_data(self):
+        self.assertEqual(self.db.execute('SELECT count(*) FROM tasks').fetchone()[0],1)
         self.assertEqual(self.db.execute("SELECT value FROM meta WHERE key='owner'").fetchone()[0],'42')
-        self.assertIsNone(self.db.execute("SELECT value FROM meta WHERE key='balance'").fetchone())
+        self.assertEqual(self.db.execute("SELECT value FROM meta WHERE key='balance'").fetchone()[0],'90')
         self.action('create',title='Новое',category='bed')
         initialize(self.path)
         self.assertEqual(self.db.execute('SELECT count(*) FROM steps').fetchone()[0],1)
@@ -42,7 +42,7 @@ class UpdateTests(unittest.TestCase):
         self.action('create',title='а'*40,category='bed')
         self.action('edit',id=1,title='Помыть зеркало',category='bath')
         self.assertEqual(self.db.execute('SELECT title,category FROM steps').fetchone(),('Помыть зеркало','bath'))
-        for title,category in [('а'*41,'bed'),('  ','bed'),('Текст','nope')]:
+        for title,category in [('а'*81,'bed'),('  ','bed'),('Текст','nope')]:
             with self.assertRaises(ValueError):
                 self.action('create',title=title,category=category)
         self.assertEqual(len(CATEGORIES),10)
